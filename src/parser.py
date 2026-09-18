@@ -1,9 +1,12 @@
 """Module for loading and validating input schemas and test prompts."""
 
+import json
 import os
 from typing import Annotated, List
+
 from pydantic import Field, TypeAdapter, ValidationError
-from models import FunctionDef, PromptDef
+
+from .models import FunctionDef, PromptDef
 
 
 def _extract_data(filepath: str) -> str:
@@ -47,25 +50,35 @@ def parse_function_definitions(filepath: str) -> List[FunctionDef]:
         filepath: The file path to the functions definition JSON file.
 
     Returns:
-        List[FunctionDef]: A list of validated FunctionDef objects.
+        A list of validated FunctionDef objects.
 
     Raises:
         FileNotFoundError: If the specified file does not exist.
         PermissionError: If read permissions are missing.
-        ValueError: If the file is not a regular file, contains invalid
-            JSON, is empty, or fails schema validation.
+        ValueError: If the file contains invalid JSON, is empty,
+            or fails schema validation.
     """
     raw_data = _extract_data(filepath)
-    input_data_pattern = Annotated[List[FunctionDef], Field(min_length=1)]
-    adapter = TypeAdapter(input_data_pattern)
 
-    ## we need to validate if the function name is valid ex:3_fn is not a valid name function
-    ## 
+    if not raw_data.strip():
+        raise ValueError(f"File is empty: {filepath}")
+
     try:
-        return adapter.validate_json(raw_data)
+        json.loads(raw_data)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid JSON in {filepath}: {exc}"
+        ) from exc
+
+    adapter: TypeAdapter[List[FunctionDef]] = TypeAdapter(
+        Annotated[List[FunctionDef], Field(min_length=1)]
+    )
+    try:
+        result: List[FunctionDef] = adapter.validate_json(raw_data)
+        return result
     except ValidationError as exc:
         raise ValueError(
-            f"Invalid JSON format or schema error in {filepath}: {exc}"
+            f"Schema validation error in {filepath}: {exc}"
         ) from exc
 
 
@@ -76,21 +89,33 @@ def parse_prompts(filepath: str) -> List[PromptDef]:
         filepath: The file path to the test prompts JSON file.
 
     Returns:
-        List[PromptDef]: A list of validated PromptDef objects.
+        A list of validated PromptDef objects.
 
     Raises:
         FileNotFoundError: If the specified file does not exist.
         PermissionError: If read permissions are missing.
-        ValueError: If the file is not a regular file, contains invalid
-            JSON, is empty, or fails schema validation.
+        ValueError: If the file contains invalid JSON, is empty,
+            or fails schema validation.
     """
     raw_data = _extract_data(filepath)
-    input_data_pattern = Annotated[List[PromptDef], Field(min_length=1)]
-    adapter = TypeAdapter(input_data_pattern)
+
+    if not raw_data.strip():
+        raise ValueError(f"File is empty: {filepath}")
 
     try:
-        return adapter.validate_json(raw_data)
+        json.loads(raw_data)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid JSON in {filepath}: {exc}"
+        ) from exc
+
+    adapter: TypeAdapter[List[PromptDef]] = TypeAdapter(
+        Annotated[List[PromptDef], Field(min_length=1)]
+    )
+    try:
+        result: List[PromptDef] = adapter.validate_json(raw_data)
+        return result
     except ValidationError as exc:
         raise ValueError(
-            f"Invalid JSON format or schema error in {filepath}: {exc}"
+            f"Schema validation error in {filepath}: {exc}"
         ) from exc

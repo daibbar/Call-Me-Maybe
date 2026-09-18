@@ -7,12 +7,8 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy>=2.2.6",
     "pydantic>=2.13.5",
-    "torch>=2.14.0",
-    "transformers>=5.17.0",
+    "llm-sdk",
 ]
-
-[project.scripts]
-call-me-maybe = "call_me_maybe:main"
 
 [build-system]
 requires = ["uv_build>=0.12.14,<0.13.0"]
@@ -20,6 +16,9 @@ build-backend = "uv_build"
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+llm-sdk = { path = "llm_sdk" }
 
 [dependency-groups]
 dev = [

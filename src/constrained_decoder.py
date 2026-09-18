@@ -1,36 +1,62 @@
-from llm_sdk.llm_sdk import Small_LLM_Model
-from models import FunctionDef
-from typing import List, Dict
+"""Constrained decoder: forces 100% valid JSON via logit masking."""
+
 import json
 import textwrap
+from typing import Dict, List, Tuple, Any
+
 import numpy as np
+
+from llm_sdk import Small_LLM_Model  # type: ignore[attr-defined]
+from .models import FunctionDef
 
 
 class ConstrainedDecoder:
-    def __init__(self, model: Small_LLM_Model, 
+    """Generate structured function-call JSON using constrained decoding.
+
+    At each token step, this class masks out all tokens that would
+    break the JSON schema, then picks the highest-scoring valid token.
+    This guarantees 100% parseable output regardless of model quality.
+    """
+
+    def __init__(self, model: Small_LLM_Model,
                  functions_def: List[FunctionDef]) -> None:
+        """Initialise decoder with an LLM and function definitions.
+
+        Args:
+            model: An instance of Small_LLM_Model.
+            functions_def: List of validated FunctionDef objects.
+        """
         self.model = model
         self.functions_def = functions_def
+        self.fct_names = [f.name for f in self.functions_def]
         self.vocab_path = self.model.get_path_to_vocab_file()
+
         self.fct_catalog = '\n'.join([
-            f"-{f.name}: {f.description} "
-            f"(params: {','.join(f'{k}: {v.type}' for k, v in f.parameters.items())})"
+            f"- {f.name}: {f.description} "
+            f"(params: {', '.join(f'{k}: {v.type}' for k, v in f.parameters.items())})"  # noqa: E501
             for f in self.functions_def
         ])
 
-        # init the vocab: open the vocab file, invert and replace
         with open(self.vocab_path, "r", encoding='utf-8') as f:
             raw_vocab: Dict[str, int] = json.load(f)
 
-        self.vocab = {
-            int(v): k.replace("Ġ", " ").replace("Ċ", "\n") 
+        # Invert and normalize space/newline markers
+        self.vocab: Dict[int, str] = {
+            int(v): k.replace("\u0120", " ").replace("\u010a", "\n")
             for k, v in raw_vocab.items()
         }
 
-        valid_chars = set("0123456789-.")
+        # Pre-filter numeric token IDs using normalized strings
+        valid_num_chars = set("0123456789.-")
         self.number_token_ids = [
-            v for k, v in raw_vocab.items()
-            if k and all(c in valid_chars for c in k)
+            tid for tid, s in self.vocab.items()
+            if s.strip() and all(c in valid_num_chars for c in s.strip())
+        ]
+
+        valid_int_chars = set("0123456789-")
+        self.integer_token_ids = [
+            tid for tid, s in self.vocab.items()
+            if s.strip() and all(c in valid_int_chars for c in s.strip())
         ]
 
         self.stop_token_ids = [
@@ -38,16 +64,23 @@ class ConstrainedDecoder:
             if s.strip() in (",", "}")
         ]
 
-        valid_int_chars = set("0123456789-")
-        self.integer_token_ids = [
-            v for k, v in raw_vocab.items()
-            if k and all(c in valid_int_chars for c in k)
-        ]
+        # Prefix cache to avoid timeouts during name decoding
+        self._prefix_cache: Dict[
+            Tuple[str, Tuple[str, ...]], List[int]
+        ] = {}
 
     def _build_prompt(self, user_prompt: str) -> str:
+        """Build the LLM prompt with function catalog and JSON template.
+
+        Args:
+            user_prompt: The user's natural language request.
+
+        Returns:
+            A formatted prompt string ready for tokenization.
+        """
         final_prompt = f"""\
-            You are a function-calling assistant that
-            helps me get a JSON format from a user prompt.
+            You are a function-calling assistant.
+            Output JSON with the correct function name and arguments.
 
             Available functions:
             {self.fct_catalog}
@@ -57,197 +90,366 @@ class ConstrainedDecoder:
             JSON:
             {{
                 "prompt": {json.dumps(user_prompt)},
-                "name": \""""
-
+                "name": \\\""""
         return textwrap.dedent(final_prompt)
 
-    def function_name_finding(self, prompt: str) -> str:
-        tensor_ids = self.model.encode(prompt)
-        input_ids = [int(x) for x in tensor_ids[0].tolist()]
-        raw_logits = self.model.get_logits_from_input_ids(input_ids)
-        logits = np.array(raw_logits).flatten()
+    def _encode_tolist(self, text: str) -> List[int]:
+        """Tokenize text into a flat list of token IDs.
 
-        mask = np.full(logits.shape, -np.inf)
-        fct_names = [fct_def.name for fct_def in self.functions_def]
-        fct_name_predection = ""
+        Args:
+            text: The string to encode.
 
-        max_fct_name_len = max(len(f) for f in fct_names)
-        for _ in range(max_fct_name_len):
-            for token_id, token_str in self.vocab.items():
-                candidate = fct_name_predection + token_str
-                for fct_name in fct_names:
-                    if fct_name.startswith(candidate) or fct_name == candidate:
-                        if token_id < len(mask):
-                            mask[token_id] = logits[token_id]
-                        break
+        Returns:
+            A list of integer token IDs.
+        """
+        tensor_ids = self.model.encode(text)
+        return [int(x) for x in tensor_ids[0].tolist()]
 
-            chosen_token_id = int(np.argmax(mask))
-            chosen_token_str = self.vocab.get(chosen_token_id, "")
+    def _get_valid_prefix_ids(
+        self, built: str, targets: List[str]
+    ) -> List[int]:
+        """Find token IDs that continue a valid prefix toward any target.
 
-            fct_name_predection += chosen_token_str
-            input_ids.append(chosen_token_id)
+        Args:
+            built: The string built so far.
+            targets: List of allowed complete strings.
 
-            if fct_name_predection in fct_names:
+        Returns:
+            List of token IDs whose text keeps built as a valid prefix.
+        """
+        cache_key = (built, tuple(targets))
+        if cache_key in self._prefix_cache:
+            return self._prefix_cache[cache_key]
+
+        valid: List[int] = []
+        for tid, token_str in self.vocab.items():
+            candidate = built + token_str
+            for target in targets:
+                if target.startswith(candidate):
+                    valid.append(tid)
+                    break
+        self._prefix_cache[cache_key] = valid
+        return valid
+
+    def function_name_finding(self, input_ids: List[int]) -> str:
+        """Constrained-decode a function name using prefix matching.
+
+        At each step only tokens that keep the generated string as a
+        valid prefix of a known function name are allowed.
+
+        Args:
+            input_ids: Current token ID context (modified in-place).
+
+        Returns:
+            The predicted function name string.
+        """
+        predicted_name = ""
+        max_len = max((len(f) for f in self.fct_names), default=20)
+
+        for _ in range(max_len + 5):
+            valid_ids = self._get_valid_prefix_ids(
+                predicted_name, self.fct_names
+            )
+            if not valid_ids:
                 break
 
-            raw_logits = self.model.get_logits_from_input_ids(input_ids)
-            logits = np.array(raw_logits).flatten()
+            logits = np.array(
+                self.model.get_logits_from_input_ids(input_ids)).flatten()
             mask = np.full(logits.shape, -np.inf)
 
-        return fct_name_predection
+            for vid in valid_ids:
+                if vid < len(mask):
+                    mask[vid] = logits[vid]
 
-    def _add_params_template(self, prompt: str) -> str:
-        return prompt.strip() + '",\n"parameters": {'
+            chosen_id = int(np.argmax(mask))
+            chosen_str = self.vocab.get(chosen_id, "")
 
-    def _encode_tolist(self, prompt: str) -> List[int]:
-        tensor_ids = self.model.encode(prompt)
-        input_ids = [int(x) for x in tensor_ids[0].tolist()]
-        return input_ids
+            predicted_name += chosen_str
+            input_ids.append(chosen_id)
+
+            if predicted_name in self.fct_names:
+                break
+
+        # BUG FIX: if decoding produced no valid name, pick first
+        if predicted_name not in self.fct_names:
+            predicted_name = self.fct_names[0] if self.fct_names else ""
+
+        return predicted_name
 
     def _generate_numbers(self, input_ids: List[int]) -> str:
-        predicted_val = ""
+        """Constrained-decode a numeric value (float).
 
+        Enforces: only digits, at most one dot, minus only at start.
+        Stops on comma, brace, or newline.
+
+        Args:
+            input_ids: Current token ID context (modified in-place).
+
+        Returns:
+            String representation of the decoded number.
+        """
+        predicted_val = ""
         for _ in range(15):
-            raw_logits = self.model.get_logits_from_input_ids(input_ids)
-            logits = np.array(raw_logits).flatten()
+            logits = np.array(
+                self.model.get_logits_from_input_ids(input_ids)
+            ).flatten()
             mask = np.full(logits.shape, -np.inf)
 
-            for candidate in self.number_token_ids:
-                if '.' in self.vocab[candidate] and '.' in predicted_val:
-                    continue
-                mask[candidate] = logits[candidate]
+            for tid in self.number_token_ids:
+                tok = self.vocab[tid].strip()
+                ok = True
+                for ch in tok:
+                    if ch == '.' and '.' in predicted_val:
+                        ok = False
+                        break
+                    if ch == '-' and predicted_val:
+                        ok = False
+                        break
+                if ok and tid < len(mask):
+                    mask[tid] = logits[tid]
 
-            if predicted_val:
-                for candidate in self.stop_token_ids:
-                    mask[candidate] = logits[candidate]
+            # Only allow stop tokens if we have at least one digit
+            if predicted_val and any(c.isdigit() for c in predicted_val):
+                for sid in self.stop_token_ids:
+                    if sid < len(mask):
+                        mask[sid] = logits[sid]
 
             chosen_id = int(np.argmax(mask))
-            prediction = self.vocab[chosen_id].strip()
-            if prediction in (',', '}'):
+            token_str = self.vocab.get(chosen_id, "")
+            stripped = token_str.strip()
+
+            if stripped in (',', '}', ''):
                 break
-            predicted_val += prediction
+
+            predicted_val += stripped
             input_ids.append(chosen_id)
-        return predicted_val or '0'
+
+        # BUG FIX: validate the final string can be parsed as float
+        try:
+            float(predicted_val)
+        except (ValueError, TypeError):
+            predicted_val = "0"
+
+        return predicted_val
 
     def _generate_integers(self, input_ids: List[int]) -> str:
-        predicted_val = ""
+        """Constrained-decode an integer value.
 
+        Enforces: only digits, minus only at start.
+        Stops on comma, brace, or newline.
+
+        Args:
+            input_ids: Current token ID context (modified in-place).
+
+        Returns:
+            String representation of the decoded integer.
+        """
+        predicted_val = ""
         for _ in range(15):
-            raw_logits = self.model.get_logits_from_input_ids(input_ids)
-            logits = np.array(raw_logits).flatten()
+            logits = np.array(
+                self.model.get_logits_from_input_ids(input_ids)
+            ).flatten()
             mask = np.full(logits.shape, -np.inf)
 
-            for candidate in self.integer_token_ids:
-                mask[candidate] = logits[candidate]
+            for tid in self.integer_token_ids:
+                tok = self.vocab[tid].strip()
+                ok = True
+                for ch in tok:
+                    if ch == '-' and predicted_val:
+                        ok = False
+                        break
+                if ok and tid < len(mask):
+                    mask[tid] = logits[tid]
 
-            if predicted_val:
-                for candidate in self.stop_token_ids:
-                    mask[candidate] = logits[candidate]
+            if predicted_val and any(c.isdigit() for c in predicted_val):
+                for sid in self.stop_token_ids:
+                    if sid < len(mask):
+                        mask[sid] = logits[sid]
 
             chosen_id = int(np.argmax(mask))
-            prediction = self.vocab[chosen_id].strip()
-            if prediction in (',', '}'):
-                break
-            predicted_val += prediction
-            input_ids.append(chosen_id)
-        return predicted_val or '0'
+            token_str = self.vocab.get(chosen_id, "")
+            stripped = token_str.strip()
 
-    def _generate_boolean(self, input_ids: List[int], max_steps: int = 10) -> bool:
+            if stripped in (',', '}', ''):
+                break
+
+            predicted_val += stripped
+            input_ids.append(chosen_id)
+
+        # BUG FIX: validate the final string can be parsed as int
+        try:
+            int(predicted_val)
+        except (ValueError, TypeError):
+            predicted_val = "0"
+
+        return predicted_val
+
+    def _generate_boolean(self, input_ids: List[int]) -> bool:
+        """Constrained-decode a boolean value (true/false).
+
+        Uses prefix matching against the literals 'true' and 'false'.
+
+        Args:
+            input_ids: Current token ID context (modified in-place).
+
+        Returns:
+            The decoded boolean value.
+        """
         allowed = ["true", "false"]
         built = ""
-
-        for _ in range(max_steps):
+        for _ in range(6):
             valid_ids = [
                 tid for tid, s in self.vocab.items()
-                if any(a.startswith(built + s.strip()) for a in allowed)
+                if any(
+                    a.startswith((built + s).strip())
+                    for a in allowed
+                )
             ]
             if not valid_ids:
                 break
 
-            raw_logits = self.model.get_logits_from_input_ids(input_ids)
-            logits = np.array(raw_logits).flatten()
+            logits = np.array(
+                self.model.get_logits_from_input_ids(input_ids)
+            ).flatten()
             mask = np.full(logits.shape, -np.inf)
             for vid in valid_ids:
-                mask[vid] = logits[vid]
+                if vid < len(mask):
+                    mask[vid] = logits[vid]
 
             chosen_id = int(np.argmax(mask))
-            token_str = self.vocab.get(chosen_id, "").strip()
-            built += token_str
+            chosen_str = self.vocab.get(chosen_id, "")
+            built += chosen_str
             input_ids.append(chosen_id)
-            if built in allowed:
+
+            if built.strip() in allowed:
                 break
 
-        return built == "true"
+        return built.strip() == "true"
 
-    def _generate_string(self, input_ids: List[int], max_steps: int = 30) -> str:
-        valid_ids = [
-            tid for tid, s in self.vocab.items()
-            if '"' not in s and "\n" not in s
-        ]
+    def _generate_string(
+        self, input_ids: List[int], max_steps: int = 50
+    ) -> str:
+        """Constrained-decode a string value (stops at closing quote).
 
+        Masks out newline tokens. When a token containing a double-quote
+        is chosen, only the part before the quote is kept.
+
+        Args:
+            input_ids: Current token ID context (modified in-place).
+            max_steps: Maximum number of tokens to generate.
+
+        Returns:
+            The decoded string content (without surrounding quotes).
+        """
         built = ""
-
         for _ in range(max_steps):
-            raw_logits = self.model.get_logits_from_input_ids(input_ids)
-            logits = np.array(raw_logits).flatten()
+            logits = np.array(
+                self.model.get_logits_from_input_ids(input_ids)
+            ).flatten()
 
-            top_id = int(np.argmax(logits))
-            top_str = self.vocab.get(top_id, "")
-            if '"' in top_str:
-                idx = top_str.index('"')
-                built += top_str[:idx]
-                break
-
+            # Mask out newlines and unescaped quotes
             mask = np.full(logits.shape, -np.inf)
-            for vid in valid_ids:
-                mask[vid] = logits[vid]
+            for tid, s in self.vocab.items():
+                if "\n" not in s and tid < len(mask):
+                    mask[tid] = logits[tid]
 
             chosen_id = int(np.argmax(mask))
             token_str = self.vocab.get(chosen_id, "")
+
+            if '"' in token_str:
+                idx = token_str.index('"')
+                built += token_str[:idx]
+                break
+
             built += token_str
             input_ids.append(chosen_id)
 
         return built.strip()
 
-    def build_dict(self, user_prompt: str) -> dict:
-        input_prompt = self._build_prompt(user_prompt)
-        fct_name_predection = self.function_name_finding(input_prompt)
-        final_prompt = self._add_params_template(input_prompt + fct_name_predection)
-        params_result = {}
+    def build_dict(self, user_prompt: str) -> Dict[str, Any]:
+        """Produce a function-call dict for the given user prompt.
 
-        for f in self.functions_def:
-            if f.name == fct_name_predection:
-                if len(f.parameters) == 0:
-                    break
+        This is the main entry point. It builds a prompt, constrained-
+        decodes the function name, then constrained-decodes each
+        parameter value according to its type from the schema.
 
-                final_prompt_ids = self._encode_tolist(final_prompt)
-                for i, p in enumerate(f.parameters):
-                    param = f'"{p}": '
-                    final_prompt_ids.extend(self._encode_tolist(param))
+        Args:
+            user_prompt: The user's natural language request.
 
-                    if f.parameters[p].type == 'number':
-                        val_prediction = self._generate_numbers(final_prompt_ids)
-                        params_result[p] = float(val_prediction)
-                    elif f.parameters[p].type == 'integer':
-                        val_prediction = self._generate_integers(final_prompt_ids)
-                        params_result[p] = int(val_prediction)
-                    elif f.parameters[p].type == 'string':
-                        val_prediction = self._generate_string(final_prompt_ids)
-                        params_result[p] = val_prediction
-                    elif f.parameters[p].type == 'boolean':
-                        bool_val = self._generate_boolean(final_prompt_ids)
-                        params_result[p] = bool_val
-                        val_prediction = "true" if bool_val else "false"
-                    else:
-                        val_prediction = '""'
+        Returns:
+            A dict with keys: prompt, name, parameters.
+        """
+        prompt_text = self._build_prompt(user_prompt)
+        input_ids = self._encode_tolist(prompt_text)
 
-                    if i + 1 < len(f.parameters):
-                        final_prompt_ids.extend(self._encode_tolist(str(val_prediction) + ', '))
+        # 1. Decode function name
+        fct_name = self.function_name_finding(input_ids)
 
-        result = {
+        # 2. Append JSON structure bridge
+        bridge = '",\n"parameters": {'
+        input_ids.extend(self._encode_tolist(bridge))
+
+        # 3. Find matching function definition
+        target_fn = next(
+            (f for f in self.functions_def if f.name == fct_name),
+            None,
+        )
+        params_result: Dict[str, Any] = {}
+
+        if target_fn and target_fn.parameters:
+            items = list(target_fn.parameters.items())
+            for i, (p_name, p_def) in enumerate(items):
+                key_prefix = f'"{p_name}": '
+                input_ids.extend(self._encode_tolist(key_prefix))
+
+                val_serialized = '""'
+
+                if p_def.type == 'number':
+                    val_str = self._generate_numbers(input_ids)
+                    try:
+                        params_result[p_name] = float(val_str)
+                    except ValueError:
+                        params_result[p_name] = 0.0
+                    val_serialized = val_str
+
+                elif p_def.type == 'integer':
+                    val_str = self._generate_integers(input_ids)
+                    try:
+                        params_result[p_name] = int(val_str)
+                    except ValueError:
+                        params_result[p_name] = 0
+                    val_serialized = val_str
+
+                elif p_def.type == 'string':
+                    input_ids.extend(self._encode_tolist('"'))
+                    val_str = self._generate_string(input_ids)
+                    params_result[p_name] = val_str
+                    val_serialized = f'"{val_str}"'
+                    input_ids.extend(self._encode_tolist('"'))
+
+                elif p_def.type == 'boolean':
+                    bool_val = self._generate_boolean(input_ids)
+                    params_result[p_name] = bool_val
+                    val_serialized = "true" if bool_val else "false"
+
+                else:
+                    # Unknown type: default to empty string
+                    params_result[p_name] = ""
+
+                # BUG FIX: feed the generated value back into context
+                # so the model sees previous param values when
+                # generating the next one (string already does this
+                # inside _generate_string, so we skip it here)
+                if p_def.type in ('number', 'integer', 'boolean'):
+                    input_ids.extend(
+                        self._encode_tolist(val_serialized)
+                    )
+
+                if i + 1 < len(items):
+                    input_ids.extend(self._encode_tolist(', '))
+
+        return {
             "prompt": user_prompt,
-            "name": fct_name_predection,
+            "name": fct_name,
             "parameters": params_result
         }
-
-        return result
