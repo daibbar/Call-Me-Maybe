@@ -154,25 +154,47 @@ class ConstrainedDecoder:
                 break
 
             logits = np.array(
-                self.model.get_logits_from_input_ids(input_ids)).flatten()
+                self.model.get_logits_from_input_ids(input_ids)
+            ).flatten()
             mask = np.full(logits.shape, -np.inf)
 
             for vid in valid_ids:
                 if vid < len(mask):
                     mask[vid] = logits[vid]
 
+            # If current name already matches a function but could
+            # also extend to a longer one (e.g. "fn_add" vs
+            # "fn_add_numbers"), unmask stop tokens so the model
+            # can choose to stop here instead of being forced to
+            # continue toward the longer name.
+            if predicted_name in self.fct_names:
+                for sid in self.stop_token_ids:
+                    if sid < len(mask):
+                        mask[sid] = logits[sid]
+
             chosen_id = int(np.argmax(mask))
             chosen_str = self.vocab.get(chosen_id, "")
+
+            # Model chose a stop token: keep the current name
+            if chosen_str.strip() in (",", "}", "\n", ""):
+                break
 
             predicted_name += chosen_str
             input_ids.append(chosen_id)
 
             if predicted_name in self.fct_names:
-                break
-
-        # BUG FIX: if decoding produced no valid name, pick first
+                # Only auto-stop if no longer name is possible
+                has_longer = any(
+                    n != predicted_name
+                    and n.startswith(predicted_name)
+                    for n in self.fct_names
+                )
+                if not has_longer:
+                    break
+                    
+        # Fallback: if decoding produced no valid name, pick first
         if predicted_name not in self.fct_names:
-            predicted_name = self.fct_names[0] if self.fct_names else ""
+            predicted_name = self.fct_names[0]
 
         return predicted_name
 
@@ -406,18 +428,12 @@ class ConstrainedDecoder:
 
                 if p_def.type == 'number':
                     val_str = self._generate_numbers(input_ids)
-                    try:
-                        params_result[p_name] = float(val_str)
-                    except ValueError:
-                        params_result[p_name] = 0.0
+                    params_result[p_name] = float(val_str)
                     val_serialized = val_str
 
                 elif p_def.type == 'integer':
                     val_str = self._generate_integers(input_ids)
-                    try:
-                        params_result[p_name] = int(val_str)
-                    except ValueError:
-                        params_result[p_name] = 0
+                    params_result[p_name] = int(val_str)
                     val_serialized = val_str
 
                 elif p_def.type == 'string':
