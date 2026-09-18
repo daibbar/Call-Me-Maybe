@@ -78,20 +78,17 @@ class ConstrainedDecoder:
         Returns:
             A formatted prompt string ready for tokenization.
         """
-        final_prompt = f"""\
-            You are a function-calling assistant.
-            Output JSON with the correct function name and arguments.
 
-            Available functions:
-            {self.fct_catalog}
-
-            User prompt: {user_prompt}
-
-            JSON:
-            {{
-                "prompt": {json.dumps(user_prompt)},
-                "name": \\\""""
-        return textwrap.dedent(final_prompt)
+        return (
+            "Convert the user request into one function call.\n"
+            "Choose the best function.\n"
+            "Extract every required parameter.\n"
+            "Copy explicit values exactly and infer only what is necessary.\n"
+            "Return only valid JSON.\n\n"
+            f"Functions:\n{self.fct_catalog}\n\n"
+            f"User: {user_prompt}\n"
+            "JSON:"
+            )
 
     def _encode_tolist(self, text: str) -> List[int]:
         """Tokenize text into a flat list of token IDs.

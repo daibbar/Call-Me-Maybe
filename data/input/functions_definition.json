@@ -1,14 +1,17 @@
 [
   {
-    "name": "",
-    "description": "Add two numbers together and return their sum.",
+    "name": "      ",
+    "description": "Multiply two numbers together and return their product.",
     "parameters": {
       "a": {
-        "type": "number"
+        "type": "khrya"
       },
       "b": {
         "type": "number"
       }
+    },
+    "returns": {
+      "type": "number"
     }
   }
 ]

@@ -1,7 +1,12 @@
 """Pydantic models for function definitions and call results."""
 
-from pydantic import BaseModel, ConfigDict
-from typing import Any, Dict
+from pydantic import BaseModel, ConfigDict, StringConstraints
+from typing import Any, Dict, Literal, Annotated
+
+valid_str = Annotated[
+    str,
+    StringConstraints(min_length=1, strip_whitespace=True)
+]
 
 
 class ParametersDef(BaseModel):
@@ -12,7 +17,7 @@ class ParametersDef(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
-    type: str
+    type: Literal["string", "number", "integer", "boolean"]
 
 
 class ReturnsDef(BaseModel):
@@ -23,7 +28,7 @@ class ReturnsDef(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
-    type: str
+    type: valid_str
 
 
 class FunctionDef(BaseModel):
@@ -37,9 +42,9 @@ class FunctionDef(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
-    name: str
-    description: str
-    parameters: Dict[str, ParametersDef]
+    name: valid_str
+    description: valid_str
+    parameters: Dict[valid_str, ParametersDef]
     returns: ReturnsDef
 
 
@@ -51,7 +56,7 @@ class PromptDef(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
-    prompt: str
+    prompt: valid_str
 
 
 class FunctionCallResult(BaseModel):
@@ -64,6 +69,6 @@ class FunctionCallResult(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
-    prompt: str
-    name: str
-    parameters: Dict[str, Any]
+    prompt: valid_str
+    name: valid_str
+    parameters: Dict[valid_str, Any]
