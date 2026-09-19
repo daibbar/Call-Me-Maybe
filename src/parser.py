@@ -2,11 +2,21 @@
 
 import json
 import os
-from typing import Annotated, List
+from typing import Annotated, Any, List, Tuple
 
 from pydantic import Field, TypeAdapter, ValidationError
 
 from .models import FunctionDef, PromptDef
+
+
+def _reject_duplicate_keys(ordered_pairs: List[Tuple[str, Any]]) -> dict:
+    """Ensure no duplicate keys exist in a JSON object."""
+    d = {}
+    for key, value in ordered_pairs:
+        if key in d:
+            raise ValueError(f"Duplicate JSON key found: {key}")
+        d[key] = value
+    return d
 
 
 def _extract_data(filepath: str) -> str:
@@ -64,8 +74,8 @@ def parse_function_definitions(filepath: str) -> List[FunctionDef]:
         raise ValueError(f"File is empty: {filepath}")
 
     try:
-        json.loads(raw_data)
-    except json.JSONDecodeError as exc:
+        json.loads(raw_data, object_pairs_hook=_reject_duplicate_keys)
+    except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError(
             f"Invalid JSON in {filepath}: {exc}"
         ) from exc
@@ -126,8 +136,8 @@ def parse_prompts(filepath: str) -> List[PromptDef]:
         raise ValueError(f"File is empty: {filepath}")
 
     try:
-        json.loads(raw_data)
-    except json.JSONDecodeError as exc:
+        json.loads(raw_data, object_pairs_hook=_reject_duplicate_keys)
+    except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError(
             f"Invalid JSON in {filepath}: {exc}"
         ) from exc
