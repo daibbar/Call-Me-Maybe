@@ -1,7 +1,7 @@
 """Pydantic models for function definitions and call results."""
 
 from pydantic import BaseModel, ConfigDict, StringConstraints
-from typing import Any, Dict, Literal, Annotated
+from typing import Dict, Literal, Annotated
 
 valid_str = Annotated[
     str,
@@ -57,18 +57,3 @@ class PromptDef(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     prompt: valid_str
-
-
-class FunctionCallResult(BaseModel):
-    """Output schema for a single function call result.
-
-    Attributes:
-        prompt: The original user prompt.
-        name: The selected function name.
-        parameters: The extracted arguments with correct types.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-    prompt: valid_str
-    name: valid_str
-    parameters: Dict[valid_str, Any]

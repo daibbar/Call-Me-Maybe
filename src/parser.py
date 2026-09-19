@@ -75,6 +75,29 @@ def parse_function_definitions(filepath: str) -> List[FunctionDef]:
     )
     try:
         result: List[FunctionDef] = adapter.validate_json(raw_data)
+
+        for f in result:
+            if not f.name.isidentifier():
+                raise ValueError(
+                    f"Function name '{f.name}' is not a valid identifier"
+                )
+            for p_name in f.parameters.keys():
+                if not p_name.isidentifier():
+                    raise ValueError(
+                        f"Parameter '{p_name}' in '{f.name}' "
+                        "is not a valid identifier"
+                    )
+
+        names = [f.name for f in result]
+        if len(names) != len(set(names)):
+            raise ValueError(f"Duplicate function names found in {filepath}")
+
+        descriptions = [f.description for f in result]
+        if len(descriptions) != len(set(descriptions)):
+            raise ValueError(
+                f"Duplicate function descriptions found in {filepath}"
+            )
+
         return result
     except ValidationError as exc:
         raise ValueError(

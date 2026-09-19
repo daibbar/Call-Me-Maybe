@@ -1,7 +1,6 @@
 """Constrained decoder: forces 100% valid JSON via logit masking."""
 
 import json
-import textwrap
 from typing import Dict, List, Tuple, Any
 
 import numpy as np
@@ -61,7 +60,17 @@ class ConstrainedDecoder:
 
         self.stop_token_ids = [
             tid for tid, s in self.vocab.items()
-            if s.strip() in (",", "}")
+            if s.strip() in (",", "}", "\n")
+        ]
+
+        self.boolean_token_ids = [
+            tid for tid, s in self.vocab.items()
+            if s.strip().lower() in ("true", "false")
+        ]
+
+        self.invalid_string_token_ids = [
+            tid for tid, s in self.vocab.items()
+            if not s.isprintable()
         ]
 
         # Prefix cache to avoid timeouts during name decoding
@@ -100,7 +109,7 @@ class ConstrainedDecoder:
             A list of integer token IDs.
         """
         tensor_ids = self.model.encode(text)
-        return [int(x) for x in tensor_ids[0].tolist()]
+        return np.array(tensor_ids).flatten().tolist()
 
     def _get_valid_prefix_ids(
         self, built: str, targets: List[str]
@@ -141,9 +150,9 @@ class ConstrainedDecoder:
             The predicted function name string.
         """
         predicted_name = ""
-        max_len = max((len(f) for f in self.fct_names), default=20)
+        max_len = max(len(f) for f in self.fct_names)
 
-        for _ in range(max_len + 5):
+        for _ in range(max_len):
             valid_ids = self._get_valid_prefix_ids(
                 predicted_name, self.fct_names
             )
@@ -188,7 +197,7 @@ class ConstrainedDecoder:
                 )
                 if not has_longer:
                     break
-                    
+
         # Fallback: if decoding produced no valid name, pick first
         if predicted_name not in self.fct_names:
             predicted_name = self.fct_names[0]
@@ -228,7 +237,7 @@ class ConstrainedDecoder:
                     mask[tid] = logits[tid]
 
             # Only allow stop tokens if we have at least one digit
-            if predicted_val and any(c.isdigit() for c in predicted_val):
+            if any(c.isdigit() for c in predicted_val):
                 for sid in self.stop_token_ids:
                     if sid < len(mask):
                         mask[sid] = logits[sid]
@@ -243,7 +252,6 @@ class ConstrainedDecoder:
             predicted_val += stripped
             input_ids.append(chosen_id)
 
-        # BUG FIX: validate the final string can be parsed as float
         try:
             float(predicted_val)
         except (ValueError, TypeError):
@@ -280,7 +288,7 @@ class ConstrainedDecoder:
                 if ok and tid < len(mask):
                     mask[tid] = logits[tid]
 
-            if predicted_val and any(c.isdigit() for c in predicted_val):
+            if any(c.isdigit() for c in predicted_val):
                 for sid in self.stop_token_ids:
                     if sid < len(mask):
                         mask[sid] = logits[sid]
@@ -295,7 +303,6 @@ class ConstrainedDecoder:
             predicted_val += stripped
             input_ids.append(chosen_id)
 
-        # BUG FIX: validate the final string can be parsed as int
         try:
             int(predicted_val)
         except (ValueError, TypeError):
@@ -306,7 +313,7 @@ class ConstrainedDecoder:
     def _generate_boolean(self, input_ids: List[int]) -> bool:
         """Constrained-decode a boolean value (true/false).
 
-        Uses prefix matching against the literals 'true' and 'false'.
+        Forces the model to choose a single token representing true or false.
 
         Args:
             input_ids: Current token ID context (modified in-place).
@@ -314,36 +321,21 @@ class ConstrainedDecoder:
         Returns:
             The decoded boolean value.
         """
-        allowed = ["true", "false"]
-        built = ""
-        for _ in range(6):
-            valid_ids = [
-                tid for tid, s in self.vocab.items()
-                if any(
-                    a.startswith((built + s).strip())
-                    for a in allowed
-                )
-            ]
-            if not valid_ids:
-                break
+        logits = np.array(
+            self.model.get_logits_from_input_ids(input_ids)
+        ).flatten()
+        mask = np.full(logits.shape, -np.inf)
 
-            logits = np.array(
-                self.model.get_logits_from_input_ids(input_ids)
-            ).flatten()
-            mask = np.full(logits.shape, -np.inf)
-            for vid in valid_ids:
-                if vid < len(mask):
-                    mask[vid] = logits[vid]
+        for tid in self.boolean_token_ids:
+            if tid < len(mask):
+                mask[tid] = logits[tid]
 
-            chosen_id = int(np.argmax(mask))
-            chosen_str = self.vocab.get(chosen_id, "")
-            built += chosen_str
-            input_ids.append(chosen_id)
+        chosen_id = int(np.argmax(mask))
+        chosen_str = self.vocab.get(chosen_id, "").strip().lower()
 
-            if built.strip() in allowed:
-                break
+        input_ids.append(chosen_id)
 
-        return built.strip() == "true"
+        return chosen_str == "true"
 
     def _generate_string(
         self, input_ids: List[int], max_steps: int = 50
@@ -366,11 +358,11 @@ class ConstrainedDecoder:
                 self.model.get_logits_from_input_ids(input_ids)
             ).flatten()
 
-            # Mask out newlines and unescaped quotes
-            mask = np.full(logits.shape, -np.inf)
-            for tid, s in self.vocab.items():
-                if "\n" not in s and tid < len(mask):
-                    mask[tid] = logits[tid]
+            # Start with all valid logits, then block unprintable/control
+            mask = logits.copy()
+            for tid in self.invalid_string_token_ids:
+                if tid < len(mask):
+                    mask[tid] = -np.inf
 
             chosen_id = int(np.argmax(mask))
             token_str = self.vocab.get(chosen_id, "")
@@ -409,54 +401,36 @@ class ConstrainedDecoder:
         input_ids.extend(self._encode_tolist(bridge))
 
         # 3. Find matching function definition
-        target_fn = next(
-            (f for f in self.functions_def if f.name == fct_name),
-            None,
-        )
+        target_fn = next(f for f in self.functions_def if f.name == fct_name)
         params_result: Dict[str, Any] = {}
 
-        if target_fn and target_fn.parameters:
+        if target_fn.parameters:
             items = list(target_fn.parameters.items())
             for i, (p_name, p_def) in enumerate(items):
                 key_prefix = f'"{p_name}": '
                 input_ids.extend(self._encode_tolist(key_prefix))
 
-                val_serialized = '""'
-
                 if p_def.type == 'number':
                     val_str = self._generate_numbers(input_ids)
                     params_result[p_name] = float(val_str)
-                    val_serialized = val_str
 
                 elif p_def.type == 'integer':
                     val_str = self._generate_integers(input_ids)
                     params_result[p_name] = int(val_str)
-                    val_serialized = val_str
 
                 elif p_def.type == 'string':
                     input_ids.extend(self._encode_tolist('"'))
                     val_str = self._generate_string(input_ids)
                     params_result[p_name] = val_str
-                    val_serialized = f'"{val_str}"'
                     input_ids.extend(self._encode_tolist('"'))
 
                 elif p_def.type == 'boolean':
                     bool_val = self._generate_boolean(input_ids)
                     params_result[p_name] = bool_val
-                    val_serialized = "true" if bool_val else "false"
 
                 else:
                     # Unknown type: default to empty string
                     params_result[p_name] = ""
-
-                # BUG FIX: feed the generated value back into context
-                # so the model sees previous param values when
-                # generating the next one (string already does this
-                # inside _generate_string, so we skip it here)
-                if p_def.type in ('number', 'integer', 'boolean'):
-                    input_ids.extend(
-                        self._encode_tolist(val_serialized)
-                    )
 
                 if i + 1 < len(items):
                     input_ids.extend(self._encode_tolist(', '))
