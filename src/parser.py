@@ -1,5 +1,3 @@
-"""Module for loading and validating input schemas and test prompts."""
-
 import json
 import os
 from typing import Annotated, Any, List, Tuple
@@ -8,9 +6,7 @@ from pydantic import Field, TypeAdapter, ValidationError
 
 from .models import FunctionDef, PromptDef
 
-
 def _reject_duplicate_keys(ordered_pairs: List[Tuple[str, Any]]) -> dict:
-    """Ensure no duplicate keys exist in a JSON object."""
     d = {}
     for key, value in ordered_pairs:
         if key in d:
@@ -18,22 +14,7 @@ def _reject_duplicate_keys(ordered_pairs: List[Tuple[str, Any]]) -> dict:
         d[key] = value
     return d
 
-
 def _extract_data(filepath: str) -> str:
-    """Validate filesystem status and read raw file contents.
-
-    Args:
-        filepath: Path to the target file.
-
-    Returns:
-        The raw string content of the file.
-
-    Raises:
-        FileNotFoundError: If the file does not exist.
-        PermissionError: If read permissions are missing.
-        ValueError: If the path is not a regular file or contains
-            invalid UTF-8 encoding.
-    """
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"File does not exist: {filepath}")
 
@@ -52,22 +33,7 @@ def _extract_data(filepath: str) -> str:
             f"Insufficient permissions to read {filepath}: {exc}"
         ) from exc
 
-
 def parse_function_definitions(filepath: str) -> List[FunctionDef]:
-    """Load and validate function definitions from a JSON file.
-
-    Args:
-        filepath: The file path to the functions definition JSON file.
-
-    Returns:
-        A list of validated FunctionDef objects.
-
-    Raises:
-        FileNotFoundError: If the specified file does not exist.
-        PermissionError: If read permissions are missing.
-        ValueError: If the file contains invalid JSON, is empty,
-            or fails schema validation.
-    """
     raw_data = _extract_data(filepath)
 
     if not raw_data.strip():
@@ -114,22 +80,7 @@ def parse_function_definitions(filepath: str) -> List[FunctionDef]:
             f"Schema validation error in {filepath}: {exc}"
         ) from exc
 
-
 def parse_prompts(filepath: str) -> List[PromptDef]:
-    """Load and validate test prompts from a JSON file.
-
-    Args:
-        filepath: The file path to the test prompts JSON file.
-
-    Returns:
-        A list of validated PromptDef objects.
-
-    Raises:
-        FileNotFoundError: If the specified file does not exist.
-        PermissionError: If read permissions are missing.
-        ValueError: If the file contains invalid JSON, is empty,
-            or fails schema validation.
-    """
     raw_data = _extract_data(filepath)
 
     if not raw_data.strip():

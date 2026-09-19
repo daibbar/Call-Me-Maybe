@@ -1,5 +1,3 @@
-"""Constrained decoder: forces 100% valid JSON via logit masking."""
-
 import json
 from typing import Dict, List, Tuple, Any
 
@@ -8,23 +6,10 @@ import numpy as np
 from llm_sdk import Small_LLM_Model  # type: ignore[attr-defined]
 from .models import FunctionDef
 
-
 class ConstrainedDecoder:
-    """Generate structured function-call JSON using constrained decoding.
-
-    At each token step, this class masks out all tokens that would
-    break the JSON schema, then picks the highest-scoring valid token.
-    This guarantees 100% parseable output regardless of model quality.
-    """
 
     def __init__(self, model: Small_LLM_Model,
                  functions_def: List[FunctionDef]) -> None:
-        """Initialise decoder with an LLM and function definitions.
-
-        Args:
-            model: An instance of Small_LLM_Model.
-            functions_def: List of validated FunctionDef objects.
-        """
         self.model = model
         self.functions_def = functions_def
         self.fct_names = [f.name for f in self.functions_def]
@@ -79,14 +64,6 @@ class ConstrainedDecoder:
         ] = {}
 
     def _build_prompt(self, user_prompt: str) -> str:
-        """Build the LLM prompt with function catalog and JSON template.
-
-        Args:
-            user_prompt: The user's natural language request.
-
-        Returns:
-            A formatted prompt string ready for tokenization.
-        """
 
         return (
             "Convert the user request into one function call.\n"
@@ -100,29 +77,12 @@ class ConstrainedDecoder:
             )
 
     def _encode_tolist(self, text: str) -> List[int]:
-        """Tokenize text into a flat list of token IDs.
-
-        Args:
-            text: The string to encode.
-
-        Returns:
-            A list of integer token IDs.
-        """
         tensor_ids = self.model.encode(text)
         return np.array(tensor_ids).flatten().tolist()
 
     def _get_valid_prefix_ids(
         self, built: str, targets: List[str]
     ) -> List[int]:
-        """Find token IDs that continue a valid prefix toward any target.
-
-        Args:
-            built: The string built so far.
-            targets: List of allowed complete strings.
-
-        Returns:
-            List of token IDs whose text keeps built as a valid prefix.
-        """
         cache_key = (built, tuple(targets))
         if cache_key in self._prefix_cache:
             return self._prefix_cache[cache_key]
@@ -138,17 +98,6 @@ class ConstrainedDecoder:
         return valid
 
     def function_name_finding(self, input_ids: List[int]) -> str:
-        """Constrained-decode a function name using prefix matching.
-
-        At each step only tokens that keep the generated string as a
-        valid prefix of a known function name are allowed.
-
-        Args:
-            input_ids: Current token ID context (modified in-place).
-
-        Returns:
-            The predicted function name string.
-        """
         predicted_name = ""
         max_len = max(len(f) for f in self.fct_names)
 
@@ -199,17 +148,6 @@ class ConstrainedDecoder:
         return predicted_name
 
     def _generate_numbers(self, input_ids: List[int]) -> str:
-        """Constrained-decode a numeric value (float).
-
-        Enforces: only digits, at most one dot, minus only at start.
-        Stops on comma, brace, or newline.
-
-        Args:
-            input_ids: Current token ID context (modified in-place).
-
-        Returns:
-            String representation of the decoded number.
-        """
         predicted_val = ""
         for _ in range(15):
             logits = np.array(
@@ -254,17 +192,6 @@ class ConstrainedDecoder:
         return predicted_val
 
     def _generate_integers(self, input_ids: List[int]) -> str:
-        """Constrained-decode an integer value.
-
-        Enforces: only digits, minus only at start.
-        Stops on comma, brace, or newline.
-
-        Args:
-            input_ids: Current token ID context (modified in-place).
-
-        Returns:
-            String representation of the decoded integer.
-        """
         predicted_val = ""
         for _ in range(15):
             logits = np.array(
@@ -305,16 +232,6 @@ class ConstrainedDecoder:
         return predicted_val
 
     def _generate_boolean(self, input_ids: List[int]) -> bool:
-        """Constrained-decode a boolean value (true/false).
-
-        Forces the model to choose a single token representing true or false.
-
-        Args:
-            input_ids: Current token ID context (modified in-place).
-
-        Returns:
-            The decoded boolean value.
-        """
         logits = np.array(
             self.model.get_logits_from_input_ids(input_ids)
         ).flatten()
@@ -334,18 +251,6 @@ class ConstrainedDecoder:
     def _generate_string(
         self, input_ids: List[int], max_steps: int = 50
     ) -> str:
-        """Constrained-decode a string value (stops at closing quote).
-
-        Masks out newline tokens. When a token containing a double-quote
-        is chosen, only the part before the quote is kept.
-
-        Args:
-            input_ids: Current token ID context (modified in-place).
-            max_steps: Maximum number of tokens to generate.
-
-        Returns:
-            The decoded string content (without surrounding quotes).
-        """
         built = ""
         for _ in range(max_steps):
             logits = np.array(
@@ -372,18 +277,6 @@ class ConstrainedDecoder:
         return built.strip()
 
     def build_dict(self, user_prompt: str) -> Dict[str, Any]:
-        """Produce a function-call dict for the given user prompt.
-
-        This is the main entry point. It builds a prompt, constrained-
-        decodes the function name, then constrained-decodes each
-        parameter value according to its type from the schema.
-
-        Args:
-            user_prompt: The user's natural language request.
-
-        Returns:
-            A dict with keys: prompt, name, parameters.
-        """
         prompt_text = self._build_prompt(user_prompt)
         input_ids = self._encode_tolist(prompt_text)
 

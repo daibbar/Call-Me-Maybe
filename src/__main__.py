@@ -1,5 +1,3 @@
-"""Execution pipeline for constrained function calling."""
-
 import argparse
 import json
 import os
@@ -11,9 +9,7 @@ from llm_sdk import Small_LLM_Model  # type: ignore[attr-defined]
 from .constrained_decoder import ConstrainedDecoder
 from .parser import parse_function_definitions, parse_prompts
 
-
 def main() -> None:
-    """Run constrained decoding over test prompts and output JSON."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--functions_definition",
@@ -79,7 +75,6 @@ def main() -> None:
     except OSError as exc:
         print(f"Error writing output file: {exc}", file=sys.stderr)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     try:
