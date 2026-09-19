@@ -168,11 +168,6 @@ class ConstrainedDecoder:
                 if vid < len(mask):
                     mask[vid] = logits[vid]
 
-            # If current name already matches a function but could
-            # also extend to a longer one (e.g. "fn_add" vs
-            # "fn_add_numbers"), unmask stop tokens so the model
-            # can choose to stop here instead of being forced to
-            # continue toward the longer name.
             if predicted_name in self.fct_names:
                 for sid in self.stop_token_ids:
                     if sid < len(mask):
@@ -189,7 +184,6 @@ class ConstrainedDecoder:
             input_ids.append(chosen_id)
 
             if predicted_name in self.fct_names:
-                # Only auto-stop if no longer name is possible
                 has_longer = any(
                     n != predicted_name
                     and n.startswith(predicted_name)
